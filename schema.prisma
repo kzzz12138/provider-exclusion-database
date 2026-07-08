@@ -1,0 +1,149 @@
+// =============================================================
+// Providers Exclusion List Database
+// Prisma schema for prisma-client-py (pin: pip install prisma==0.15.0)
+//
+// Design decisions (agreed with supervisor):
+//   1. ALL columns are NOT NULL (no `?` optional fields).
+//   2. Missing data is represented by sentinel values:
+//        - strings      -> ''            (empty string)
+//        - dates        -> 1900-01-01    (sentinel date)
+//        - identifiers  -> rows with placeholder values
+//                          ('0000000000') are simply not inserted
+//                          into IDENTIFIER at all.
+//   3. Source date format YYYYMMDD is parsed to real DATE during
+//      the pandas cleaning step; '00000000' becomes the sentinel.
+//
+// Build steps:
+//   prisma db push      # create tables in Postgres
+//   prisma generate     # generate the Python client
+// =============================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "sync" // simpler for ETL scripts; use "asyncio" if you prefer
+  recursive_type_depth = 5
+}
+
+// -------------------------------------------------------------
+// DATA_SOURCE: one row per source list (federal LEIE, GA DCH, ...)
+// -------------------------------------------------------------
+model DataSource {
+  sourceId    Int      @id @default(autoincrement()) @map("source_id")
+  sourceName  String   @map("source_name") @db.VarChar(100) // e.g. 'OIG LEIE', 'GA DCH OIG'
+  sourceLevel String   @map("source_level") @db.VarChar(20) // 'FEDERAL' | 'STATE'
+  fileName    String   @map("file_name") @db.VarChar(255)
+  fileType    String   @map("file_type") @db.VarChar(10) // 'CSV' | 'XLSX'
+  sourceDate  DateTime @map("source_date") @db.Date // snapshot date of the list
+
+  importLogs       ImportLog[]
+  exclusionRecords ExclusionRecord[]
+
+  @@unique([sourceName, sourceDate])
+  @@map("data_source")
+}
+
+// -------------------------------------------------------------
+// IMPORT_LOG: one row per import run (audit trail)
+// -------------------------------------------------------------
+model ImportLog {
+  importId        Int      @id @default(autoincrement()) @map("import_id")
+  sourceId        Int      @map("source_id")
+  importDate      DateTime @map("import_date") @db.Date
+  recordsImported Int      @map("records_imported")
+  notes           String   @default("") @map("notes") @db.VarChar(500)
+
+  source           DataSource        @relation(fields: [sourceId], references: [sourceId])
+  exclusionRecords ExclusionRecord[]
+
+  @@index([sourceId])
+  @@map("import_log")
+}
+
+// -------------------------------------------------------------
+// EXCLUDED_PARTY: one row per unique individual or entity
+//   partyType = 'INDIVIDUAL' -> lastName/firstName filled, businessName = ''
+//   partyType = 'ENTITY'     -> businessName filled, name fields = ''
+//   (GA list has 7 rows with both -> keep both filled, type by business name)
+// -------------------------------------------------------------
+model ExcludedParty {
+  partyId      Int      @id @default(autoincrement()) @map("party_id")
+  partyType    String   @map("party_type") @db.VarChar(12) // 'INDIVIDUAL' | 'ENTITY'
+  lastName     String   @default("") @map("last_name") @db.VarChar(50)
+  firstName    String   @default("") @map("first_name") @db.VarChar(50)
+  middleName   String   @default("") @map("middle_name") @db.VarChar(100)
+  businessName String   @default("") @map("business_name") @db.VarChar(100)
+  dob          DateTime @default(dbgenerated("'1900-01-01'::date")) @map("dob") @db.Date
+  address      String   @default("") @map("address") @db.VarChar(60) // source truncates at 30; headroom kept
+  city         String   @default("") @map("city") @db.VarChar(50)
+  state        String   @default("") @map("state") @db.VarChar(30)
+  zipCode      String   @default("") @map("zip_code") @db.VarChar(10)
+
+  identifiers      Identifier[]
+  exclusionRecords ExclusionRecord[]
+
+  @@index([lastName, firstName, dob])
+  @@index([businessName])
+  @@map("excluded_party")
+}
+
+// -------------------------------------------------------------
+// IDENTIFIER: real identifiers only.
+//   Placeholder values ('0000000000', '') are NOT inserted —
+//   "no identifier" is represented by having no row here,
+//   which keeps the unique constraint meaningful.
+//   NPIs are NOT unique across parties in the source data
+//   (358 duplicated NPIs found), so uniqueness is per
+//   (party, type, value), not global.
+// -------------------------------------------------------------
+model Identifier {
+  identifierId    Int    @id @default(autoincrement()) @map("identifier_id")
+  partyId         Int    @map("party_id")
+  identifierType  String @map("identifier_type") @db.VarChar(10) // 'NPI' | 'UPIN'
+  identifierValue String @map("identifier_value") @db.VarChar(20)
+
+  party ExcludedParty @relation(fields: [partyId], references: [partyId])
+
+  @@unique([partyId, identifierType, identifierValue])
+  @@index([identifierValue])
+  @@map("identifier")
+}
+
+// -------------------------------------------------------------
+// EXCLUSION_RECORD: one row per exclusion event.
+//   State (GA) rows have no specialty / exclusionType / waiver
+//   info -> sentinel '' / 1900-01-01.
+//   reinstatementDate is ALWAYS the sentinel on import, because
+//   both source lists only contain currently-active exclusions.
+//   recentlyAdded captures the GA list's highlighted rows
+//   (317 in the 06/09/2026 snapshot); false for federal rows.
+// -------------------------------------------------------------
+model ExclusionRecord {
+  exclusionId       Int      @id @default(autoincrement()) @map("exclusion_id")
+  partyId           Int      @map("party_id")
+  sourceId          Int      @map("source_id")
+  importId          Int      @map("import_id")
+  generalCategory   String   @default("") @map("general_category") @db.VarChar(50)
+  specialty         String   @default("") @map("specialty") @db.VarChar(50)
+  exclusionType     String   @default("") @map("exclusion_type") @db.VarChar(20) // e.g. '1128b4'
+  exclusionDate     DateTime @map("exclusion_date") @db.Date // 100% present in both sources
+  reinstatementDate DateTime @default(dbgenerated("'1900-01-01'::date")) @map("reinstatement_date") @db.Date
+  waiverDate        DateTime @default(dbgenerated("'1900-01-01'::date")) @map("waiver_date") @db.Date
+  waiverState       String   @default("") @map("waiver_state") @db.VarChar(2)
+  status            String   @default("ACTIVE") @map("status") @db.VarChar(12) // 'ACTIVE' | 'REINSTATED'
+  recentlyAdded     Boolean  @default(false) @map("recently_added")
+
+  party     ExcludedParty @relation(fields: [partyId], references: [partyId])
+  source    DataSource    @relation(fields: [sourceId], references: [sourceId])
+  importLog ImportLog     @relation(fields: [importId], references: [importId])
+
+  @@index([partyId])
+  @@index([sourceId])
+  @@index([exclusionDate])
+  @@index([exclusionType])
+  @@map("exclusion_record")
+}

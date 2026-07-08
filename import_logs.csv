@@ -1,0 +1,3 @@
+import_id,source_id,import_date,records_imported,notes
+1,1,2026-07-06,83464,Initial import of federal LEIE snapshot
+2,2,2026-07-06,1370,Initial import of GA DCH snapshot; highlighted rows flagged as recently_added

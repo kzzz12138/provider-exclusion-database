@@ -76,6 +76,7 @@ identifiers.csv       # Identifier records such as NPI or UPIN
 parties.csv           # Excluded individual or business records
 sources.csv           # Source metadata
 import_logs.csv       # Import tracking information
+```
 
 ## How to Set Up This Project
 
